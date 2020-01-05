@@ -1,363 +1,262 @@
-import numpy as np
 from scipy import linalg as la
+import matplotlib.pyplot as pl
+import numpy as np
+ 
+import quadrotor as quad
+import formation_distance as form
+import quadlog
+import animation as ani
+ 
+# Quadrotor
+m = 0.65  # Kg
+l = 0.23  # m
+Jxx = 7.5e-3  # Kg/m^2
+Jyy = Jxx
+Jzz = 1.3e-2
+Jxy = 0
+Jxz = 0
+Jyz = 0
+J = np.array([[Jxx, Jxy, Jxz],
+              [Jxy, Jyy, Jyz],
+              [Jxz, Jyz, Jzz]])
+CDl = 9e-3
+CDr = 9e-4
+kt = 3.13e-5  # Ns^2
+km = 7.5e-7   # Ns^2
+kw = 1/0.18   # rad/s
+ 
+# Initial conditions
+att_0 = np.array([0.0, 0.0, 0.0])
+pqr_0 = np.array([0.0, 0.0, 0.0])
+xyzt_0 = np.array([0.0, 0.0, -0.0])
+xyz1_0 = np.array([1.0, 1.2, -0.0])
+xyz2_0 = np.array([1.2, 2.0, -0.0])
+xyz3_0 = np.array([-1.1, 2.6, -0.0])
+v_ned_0 = np.array([0.0, 0.0, 0.0])
+w_0 = np.array([0.0, 0.0, 0.0, 0.0])
+ 
+# Setting quads
+qt = quad.quadrotor(0, m, l, J, CDl, CDr, kt, km, kw,
+                    att_0, pqr_0, xyzt_0, v_ned_0, w_0)
+ 
+q1 = quad.quadrotor(1, m, l, J, CDl, CDr, kt, km, kw,
+                    att_0, pqr_0, xyz1_0, v_ned_0, w_0)
+ 
+q2 = quad.quadrotor(2, m, l, J, CDl, CDr, kt, km, kw,
+                    att_0, pqr_0, xyz2_0, v_ned_0, w_0)
+ 
+q3 = quad.quadrotor(3, m, l, J, CDl, CDr, kt, km, kw,
+                    att_0, pqr_0, xyz3_0, v_ned_0, w_0)
+ 
+ 
+# Simulation parameters
+tf = 500
+dt = 5e-2
+time = np.linspace(0, tf, tf/dt)
+it = 0
+frames = 50
+ 
+# Data log
+qt_log = quadlog.quadlog(time)
+q1_log = quadlog.quadlog(time)
+q2_log = quadlog.quadlog(time)
+q3_log = quadlog.quadlog(time)
+ 
+# Plots
+quadcolor = ['m', 'r', 'g', 'b']
+pl.close("all")
+pl.ion()
+fig = pl.figure(0)
+axis3d = fig.add_subplot(111, projection='3d')
+ 
+init_area = 5
+s = 2
+ 
+# Desired altitude and heading
+alt_d = 2
+q1.yaw_d = 0
+q2.yaw_d = 0
+q3.yaw_d = 0
+ 
+# Constants
+tangentHelp = np.array([[0, -1], [1, 0]])
+ 
+def impPath(x, y, r):
+    return ((x-qt.xyz[0])**2 + (y-qt.xyz[1])**2 - r**2)
+ 
+def angle_to_chord(radius, angle):
+    return (2 * radius * np.sin((angle / 57.3) / 2))
+ 
+def to_euclid(xyz):
+    return (np.sqrt(xyz[0]*xyz[0] + xyz[1]*xyz[1] + xyz[2]*xyz[2]))
 
-class quadrotor:
-    def __init__(self, tag, m, l, J, CDl, CDr, kt, km, kw, att, \
-            pqr, xyz, v_ned, w):
-        # physical constants
-        self.tag = tag
-        self.m = m   # [Kg]
-        self.l = l   # [m]
-        self.J = J   # Inertia matrix  [Kg/m^2]
-        self.Jinv = la.inv(J)
-        self.CDl = CDl  # Linear Drag coefficient
-        self.CDr = CDr  # Angular Drag coefficient
-        self.kt = kt    # Propeller thrust [N s^2]
-        self.km = km    # Propeller moment [N m s^2]
-        self.kw = kw    # Motor transient [1/s]
-
-        # Configuration of the propellers
-        self.w_to_Tlmn = np.array([[   -kt,  -kt,  -kt,   -kt],\
-                                   [     0,-l*kt,    0,  l*kt],\
-                                   [  l*kt,    0,-l*kt,     0],\
-                                   [   -km,   km,  -km,   km]])
-        self.Tlmn_to_w = la.inv(self.w_to_Tlmn)
-        
-        # Physical variables
-        self.att = att # Attitude [rad]
-        self.pqr = pqr # Body angular velocity [rad/sec]
-        self.xyz = xyz # Body position NED [m]
-        self.v_ned = v_ned # Body linear velocity NED [m/sec]
-        self.w = w # Actual angular velocity of the propellers [rad/sec]
-        self.Ft = np.array([0.0, 0.0, 0.0]) # Motor (Thrust) Force [N]
-        self.Fa = np.array([0.0, 0.0, 0.0]) # Aerodynamic Forces [N]
-        self.Mt = np.array([0.0, 0.0, 0.0]) # Motor Moment [N m]
-        self.Ma = np.array([0.0, 0.0, 0.0]) # Aerodynamic Moments [N m]
-        self.crashed = 0 # Ground hit?
-
-        ## GNC variables
-        # Geometric (1) or std (0) attitude controller
-        self.att_con = 1
-
-        # Gains for the attitude controller
-        self.kp = 2
-        self.kq = 2
-        self.kr = 2
-        # Gains for classical controllers
-        self.k_pos = 2e-1
-        self.k_vel = 2e-1
-        # Gains for Lyapunov controllers
-        self.k_alt = 1e-2
-        self.k_vz = 1
-        self.k_xy = 1e-2
-        self.k_vxy = 1e-1
-        self.k_xi_g_v = 1e-1
-        self.k_xi_g_e_alt = 5e-3
-        self.k_xi_CD_e_v = 1e-3
-        self.e_alt = 0 # We need it for the estimator xi_g
-        self.e_v = np.array([0, 0]) # We need it for the estimator xi_Cd
-        # Gains for geometric att controller
-        self.k_eR = 5e-3
-        self.k_om = 1e-2
-
-        self.T_d = 0 # Desired thrust [N]
-        self.lmn_d = np.array([0.0, 0.0, 0.0]) # Desired angular momentum [N m]
-        self.w_d = w # Desired angular velocity for the propellers [rad/sec]
-        # Desired attitude roll, pitch [rads]
-        self.att_d = np.array([0.0, 0.0, 0.0])
-        # Hoovering desired 3D position NED [m]
-        self.xyz_d = np.array([0.0, 0.0, 0.0])
-        self.v_ned_d = np.array([0.0, 0.0, 0.0]) # Desired vel 3D NED
-        self.yaw_d = 0  # Desired yaw [rad]
-        # Estimators
-        self.xi_g = 9.8 # Initial guess of gravity
-        self.xi_CD = 0
-        self.rel_xyz = 0 #[]
-        self.neighbour_vector = 0 #[]
-
-    '''
-    def broadcast_rel_xyz(qx, qt):
-        rel_xyz = qx.xyz - qt.xyz
-        return rel_xyz
-    '''
-    #'''
-    def broadcast_rel_xyz(self, qt):
-        self.rel_xyz = qt.xyz - self.xyz 
-        return self.rel_xyz
-    #'''
-    #'''
-    def calc_neighbour_vector(self, qx):
-        self.neighbour_vector = self.rel_xyz - qx.rel_xyz
-        return self.neighbour_vector
-    #'''
-
-    ### GNC Functions ###
-    def control_att(self):
-        # Attitude controller Lyapunov approach
-        ephi = self.att[0] - self.att_d[0]
-        ethe = self.att[1] - self.att_d[1]
-        epsi = self.att[2] - self.att_d[2]
-
-        # Desired moments
-        self.lmn_d[0] = -self.J[0, 0]*(ephi + self.kp*self.pqr[0]) \
-             -(self.J[1, 1]-self.J[2, 2])*self.pqr[1]*self.pqr[2]
-
-        self.lmn_d[1] = -self.J[1, 1]*(ethe + self.kq*self.pqr[1]) \
-             -(self.J[2, 2]-self.J[0, 0])*self.pqr[2]*self.pqr[0] \
-
-        self.lmn_d[2] = -self.J[2, 2]*(epsi + self.kr*self.pqr[2])
-
-    def control_att_geometric(self):
-        R = self.Rot_bn().transpose()
-        Rd = self.Rotd_bn(self.att_d[0], self.att_d[1], self.att_d[2]).transpose()
-
-        e_RM = 0.5*(Rd.transpose().dot(R) - R.transpose().dot(Rd))
-        e_R = self.build_vector_from_tensor(e_RM)
-
-        om = np.array([self.pqr[0], self.pqr[1], self.pqr[2]])
-        e_om = om
-
-        M = -self.k_eR*e_R -self.k_om*e_om + np.cross(om, self.J.dot(om))
-
-        self.lmn_d = M
+def sigmoid(u):
+    mag = np.linalg.norm(u)
+    range_s = 7.0
+    curv = -0.5
+    new_mag = (range_s / (1 + 2.73 ** ((curv) * mag))) - range_s/2
+    mag_scale = new_mag / mag
+    new_u = u * mag_scale
+    return new_u
 
 
-    ## Lyapunov based controllers
-
-    # Input: Desired 3D position
-    def set_xyz_ned_lya(self, xyz_d):
-        e_alt  = self.xyz[2] - xyz_d[2]
-        self.e_alt = e_alt
-        e_xy   = self.xyz[0:2] - xyz_d[0:2]
-        
-        self.T_d = (-self.xi_g -self.k_alt*e_alt \
-                -self.k_vz*self.v_ned[2])*self.m
-
-        axy = -self.k_xy*e_xy -self.k_vxy*self.v_ned[0:2]
-        ax = axy[0]
-        ay = axy[1]
-        # Guidance attitude
-        phi_d = -self.m/self.T_d*(ay*np.cos(self.att[2])-ax*np.sin(self.att[2]))
-        the_d =  self.m/self.T_d*(ax*np.cos(self.att[2])+ay*np.sin(self.att[2]))
-
-        # Control motors
-        self.att_d = np.array([phi_d, the_d, self.yaw_d])
-        if self.att_con == 0:
-            self.control_att()
-        elif self.att_con == 1:
-            self.control_att_geometric()
-
-        self.w_d = np.sqrt(self.Tlmn_to_w.dot(np.append(self.T_d, self.lmn_d)))
-
-    # Input: Desired 2D acceleration, Desired altitude
-    def set_a_2D_alt_lya(self, a_2d_d, altitude_d):
-        e_alt  = self.xyz[2] - altitude_d
-        self.e_alt = e_alt
-        self.T_d = (-self.xi_g -self.k_alt*e_alt \
-                -self.k_vz*self.v_ned[2])*self.m
-
-        ax = a_2d_d[0]
-        ay = a_2d_d[1]
-        # Guidance attitude
-        phi_d = -self.m/self.T_d*(ay*np.cos(self.att[2])-ax*np.sin(self.att[2]))
-        the_d =  self.m/self.T_d*(ax*np.cos(self.att[2])+ay*np.sin(self.att[2]))
-
-        # Control motors
-        self.att_d = np.array([phi_d, the_d, self.yaw_d])
-        if self.att_con == 0:
-            self.control_att()
-        elif self.att_con == 1:
-            self.control_att_geometric()
-
-        self.w_d = np.sqrt(self.Tlmn_to_w.dot(np.append(self.T_d, self.lmn_d)))
-
-    def step_estimator_xi_g(self, dt):
-        self.xi_g = self.xi_g + self.k_xi_g_v*self.v_ned[2]*dt \
-        + self.k_xi_g_e_alt*self.e_alt*dt
-
-    # Input: Desired 2D velocity, Desired altitude
-    def set_v_2D_alt_lya(self, vxy_d, alt_d):
-        e_alt  = self.xyz[2] - alt_d
-        self.e_alt = e_alt
-        vxy = self.v_ned[0:2]
-        e_v = vxy - vxy_d
-        self.e_v = e_v
-
-        self.T_d = (-self.xi_g -self.k_alt*e_alt \
-                -self.k_vz*self.v_ned[2])*self.m
+radius = 3
+angle_list = [120, 120, 120]#[50, 50, 260]#
+des_dist_list = [0, 0, 0]
+for idx in range(0,len(angle_list)):
+    des_dist_list[idx] = angle_to_chord(radius, angle_list[idx])
+ 
+act_dist_list = [0, 0, 0]
+qc_list = [q1, q2, q3]
+err_dist_list = [0, 0, 0]
+unit_vector_list = [[0,0,0],[0,0,0],[0,0,0]]
+growing_r = 0
+ 
+for t in time:
+   
+    q1.broadcast_rel_xyz(qt)
+    q2.broadcast_rel_xyz(qt)
+    q3.broadcast_rel_xyz(qt)
+    for idx in range(0,len(qc_list)):
+        act_dist_list[idx] = to_euclid(qc_list[idx].calc_neighbour_vector(qc_list[(idx + 1) % len(qc_list)]))
+ 
+    for idx in range(0, len(qc_list)):
+        err_dist_list[idx] = act_dist_list[idx] - des_dist_list[idx]
+ 
+    for idx in range(0, len(qc_list)):
+        unit_vector_list[idx][0] = qc_list[idx].calc_neighbour_vector(qc_list[(idx + 1) % len(qc_list)])[0] / act_dist_list[idx]
+        unit_vector_list[idx][1] = qc_list[idx].calc_neighbour_vector(qc_list[(idx + 1) % len(qc_list)])[1] / act_dist_list[idx]
+        unit_vector_list[idx][2] = qc_list[idx].calc_neighbour_vector(qc_list[(idx + 1) % len(qc_list)])[2] / act_dist_list[idx]
+ 
+ 
+    # Simulation
+    X = np.append(q1.xyz[0:2], np.append(q2.xyz[0:2], q3.xyz[0:2]))
+    V = np.append(q1.v_ned[0:2], np.append(q2.v_ned[0:2], q3.v_ned[0:2]))
+ 
+    gradF1 = np.array([(X[0] - qt.xyz[0])*2, (X[1] - qt.xyz[1])*2])
+    gradF2 = np.array([(X[2] - qt.xyz[0])*2, (X[3] - qt.xyz[1])*2])
+    gradF3 = np.array([(X[4] - qt.xyz[0])*2, (X[5] - qt.xyz[1])*2])
+ 
+    tangent1 = tangentHelp.dot((gradF1/la.norm(gradF1)))
+    tangent2 = tangentHelp.dot((gradF2/la.norm(gradF2)))
+    tangent3 = tangentHelp.dot((gradF3/la.norm(gradF3)))
 
 
-        axy = self.xi_CD*la.norm(vxy)*vxy -self.k_vxy*e_v
-        ax = axy[0]
-        ay = axy[1]
-        # Guidance attitude
-        phi_d = -self.m/self.T_d*(ay*np.cos(self.att[2])-ax*np.sin(self.att[2]))
-        the_d =  self.m/self.T_d*(ax*np.cos(self.att[2])+ay*np.sin(self.att[2]))
+    e1 = impPath(X[0], X[1], 0) #radius
+    e2 = impPath(X[2], X[3], 0)
+    e3 = impPath(X[4], X[5], 0)
+    ke = 0.008  # Gain for going towards circle
+    kt = 0  # Gain for velocity
+    kf = 0.1
+ 
+    # This small u is our circle following control input (velocity)
+    # The form is:
+    # ControlInput = FollowCircleError + RotateOnCircle + StayInFormationDistance
+    formation1 = np.array([(err_dist_list[0]*unit_vector_list[0][0] + err_dist_list[2]*unit_vector_list[0][0])*kf, (err_dist_list[0]*unit_vector_list[0][1] + err_dist_list[0]*unit_vector_list[2][1])*kf])
+    formation2 = np.array([(err_dist_list[1]*unit_vector_list[1][0] + err_dist_list[0]*unit_vector_list[1][0])*kf, (err_dist_list[1]*unit_vector_list[1][1] + err_dist_list[1]*unit_vector_list[0][1])*kf])
+    formation3 = np.array([(err_dist_list[2]*unit_vector_list[2][0] + err_dist_list[1]*unit_vector_list[2][0])*kf, (err_dist_list[2]*unit_vector_list[2][1] + err_dist_list[2]*unit_vector_list[1][1])*kf])
+ 
+    #print(err_dist_list)
+ 
+    u1 = ke*(-e1)*gradF1 + kt*tangent1 + formation1
+    u2 = ke*(-e2)*gradF2 + kt*tangent2 + formation2
+    u3 = ke*(-e3)*gradF3 + kt*tangent3 + formation3
 
-        # Control motors
-        self.att_d = np.array([phi_d, the_d, self.yaw_d])
-        if self.att_con == 0:
-            self.control_att()
-        elif self.att_con == 1:
-            self.control_att_geometric()
-
-        self.w_d = np.sqrt(self.Tlmn_to_w.dot(np.append(self.T_d, self.lmn_d)))
-
-    def step_estimator_xi_CD(self, dt):
-        self.xi_CD = self.xi_CD \
-                - self.k_xi_CD_e_v*la.norm(self.v_ned[0:2])*(self.e_v.T).dot(self.v_ned[0:2])*dt
-
-    ### Physics Simulation ###
-    def step(self, dt):
-        self.step_rotors(dt)
-        self.step_6DoF(dt)
-        self.step_estimator_xi_g(dt)
-        self.step_estimator_xi_CD(dt)
-
-    def step_rotors(self, dt): # Motors modelled as 1st order linear system
-        # Check Saturation 
-        for i in range (0, 4):
-            if self.w_d[i] < 0:
-                self.w_d[i] = 0
-            elif self.w_d[i] > 500:
-                self.w_d[i] = 500
-
-        e_w = self.w - self.w_d
-        w_dot = -self.kw*np.identity(4).dot(e_w)
-        self.w = self.w + w_dot*dt
-
-    def step_6DoF(self, dt):
-        Rbn = self.Rot_bn() # Rotational matrix from Nav to Body
-        g = np.array([0, 0, 9.81]) # Gravity vector
-        p_dot = Rbn.dot(self.v_ned) # Velocity in body coordinates
-
-        self.rotors_forces_moments() # Forces and moments by motors
-        self.aero_forces_moments()   # Forces and moments by environment
-
-        # Time derivatives (acc and vel) given by physics equations
-        att_dot = (self.R_pqr()).dot(self.pqr)
-        p_ddot = (self.Ft + self.Fa)/self.m + Rbn.dot(g) \
-                - np.cross(self.pqr, p_dot)
-        pqr_dot = self.Jinv.dot(self.Mt + self.Ma \
-                - np.cross(self.pqr, self.J.dot(self.pqr)))
-
-        # Propagation of positions/angles and velocities
-        self.att = self.att + att_dot*dt
-        #for i in range(0,3):
-        #    self.att[i] = self.norm_ang(self.att[i])
-        self.pqr = self.pqr + pqr_dot*dt
-
-        # Touching the ground?
-        if self.xyz[2] > 0:
-            self.xyz[2] = 0
-            if la.norm(self.v_ned) > 0.5:
-                print self.tag, "crashed into the ground"
-                self.crashed = 1
-            self.v_ned[0:3] = 0
-        else:
-            self.v_ned = self.v_ned + Rbn.T.dot(p_ddot)*dt
-            self.xyz = self.xyz + self.v_ned*dt
-
-    # Forces and moments given by motors and environment
-    def rotors_forces_moments(self):
-        Tlmn = self.w_to_Tlmn.dot(np.array([self.w[0]**2, \
-                self.w[1]**2, self.w[2]**2, self.w[3]**2]))
-
-        self.Ft = np.array([0, 0, Tlmn[0]]) # Thrust
-        self.Mt = Tlmn[1:4] # Moment
-
-    def aero_forces_moments(self):
-        Rbn = self.Rot_bn()
-        p_dot = Rbn.dot(self.v_ned)
-
-        Dl = -p_dot*la.norm(p_dot)*self.CDl # Linear drag
-        Dr = -self.pqr*la.norm(self.pqr)*self.CDr # Angular drag
-        
-        self.Fa = Dl # Forces by the environment
-        self.Ma = Dr # Moments by the environment
-
-    ### Misc ###
-    # Angles always between -pi and pi
-    def norm_ang(self, x):
-        if x > np.pi:
-            x = x - 2*np.pi
-        elif x <= -np.pi:
-            x = x + 2*np.pi
-        return x
-    
-    # Rotational matrix from Nav to Body
-    def Rot_bn(self):
-        phi = self.att[0]
-        theta = self.att[1]
-        psi = self.att[2]
-        cphi = np.cos(phi)
-        sphi = np.sin(phi)
-        cthe = np.cos(theta)
-        sthe = np.sin(theta)
-        cpsi = np.cos(psi)
-        spsi = np.sin(psi)
-
-        Rx = np.array([[1,    0,      0], \
-                       [0,  cphi,  sphi], \
-                       [0, -sphi,  cphi]])
-
-        Ry = np.array([[cthe,  0,  -sthe], \
-                       [   0,  1,      0], \
-                       [sthe,  0,   cthe]])
-
-        Rz = np.array([[ cpsi,  spsi, 0], \
-                       [-spsi,  cpsi, 0], \
-                       [    0,    0, 1]])
-
-        R = Rx.dot(Ry).dot(Rz)
-        return R
-
-    # Rotation matrix from Nav to given Body attitude
-    def Rotd_bn(self, phi, theta, psi):
-        cphi = np.cos(phi)
-        sphi = np.sin(phi)
-        cthe = np.cos(theta)
-        sthe = np.sin(theta)
-        cpsi = np.cos(psi)
-        spsi = np.sin(psi)
-
-        Rx = np.array([[1,    0,      0], \
-                       [0,  cphi,  sphi], \
-                       [0, -sphi,  cphi]])
-
-        Ry = np.array([[cthe,  0,  -sthe], \
-                       [   0,  1,      0], \
-                       [sthe,  0,   cthe]])
-
-        Rz = np.array([[ cpsi,  spsi, 0], \
-                       [-spsi,  cpsi, 0], \
-                       [    0,    0, 1]])
-
-        R = Rx.dot(Ry).dot(Rz)
-        return R
-
-    
-    # Propagation matrix for computing the angular velocity of the attitude
-    def R_pqr(self):
-        phi = self.att[0]
-        theta = self.att[1]
-        tthe = np.tan(theta)
-        cthe = np.cos(theta)
-        cphi = np.cos(phi)
-        sphi = np.sin(phi)
-
-        R = np.array([[1, tthe*sphi, tthe*cphi], \
-                      [0,      cphi,     -sphi], \
-                      [0, sphi/cthe, cphi/cthe]])
-        return R
-
-    # Building a tensor from vector and viceversa
-    def build_tensor_from_vector(self, a, b, c):
-        T = np.array([[ 0, -c,  b],
-                      [ c,  0, -a],
-                      [-b,  a,  0]])
-        return T
-
-    def build_vector_from_tensor(self, T):
-        v = np.array([T[2, 1], T[0, 2], T[1, 0]])
-        return v
+    u1 = sigmoid(u1)
+    u2 = sigmoid(u2)
+    u3 = sigmoid(u3)
+ 
+    zero = np.array([0, 0])
+    ut = np.array([0.0, 0.0]) # move the middle drone qt a little bit in x and y
+    qt.set_v_2D_alt_lya(ut, -alt_d)
+    q1.set_v_2D_alt_lya(u1, -alt_d)
+    q2.set_v_2D_alt_lya(u2, -alt_d)
+    q3.set_v_2D_alt_lya(u3, -alt_d)
+ 
+    qt.step(dt)
+    q1.step(dt)
+    q2.step(dt)
+    q3.step(dt)
+ 
+    # Animation
+    if it % frames == 0:
+ 
+        pl.figure(0)
+        axis3d.cla()
+        ani.draw3d(axis3d, qt.xyz, qt.Rot_bn(), quadcolor[0])
+        ani.draw3d(axis3d, q1.xyz, q1.Rot_bn(), quadcolor[1])
+        ani.draw3d(axis3d, q2.xyz, q2.Rot_bn(), quadcolor[2])
+        ani.draw3d(axis3d, q3.xyz, q3.Rot_bn(), quadcolor[3])
+        axis3d.set_xlim(-10, 10)
+        axis3d.set_ylim(-10, 10)
+        axis3d.set_zlim(0, 10)
+        axis3d.set_xlabel('South [m]')
+        axis3d.set_ylabel('East [m]')
+        axis3d.set_zlabel('Up [m]')
+        axis3d.set_title("Time %.3f s" % t)
+        pl.pause(0.001)
+        pl.draw()
+        # namepic = '%i'%it
+        # digits = len(str(it))
+        # for j in range(0, 5-digits):
+        #    namepic = '0' + namepic
+        # pl.savefig("./images/%s.png"%namepic)
+ 
+ 
+    # Log
+    qt_log.xyz_h[it, :] = qt.xyz
+    qt_log.att_h[it, :] = qt.att
+    qt_log.w_h[it, :] = qt.w
+    qt_log.v_ned_h[it, :] = qt.v_ned
+ 
+    q1_log.xyz_h[it, :] = q1.xyz
+    q1_log.att_h[it, :] = q1.att
+    q1_log.w_h[it, :] = q1.w
+    q1_log.v_ned_h[it, :] = q1.v_ned
+ 
+    q2_log.xyz_h[it, :] = q2.xyz
+    q2_log.att_h[it, :] = q2.att
+    q2_log.w_h[it, :] = q2.w
+    q2_log.v_ned_h[it, :] = q2.v_ned
+ 
+    q3_log.xyz_h[it, :] = q3.xyz
+    q3_log.att_h[it, :] = q3.att
+    q3_log.w_h[it, :] = q3.w
+    q3_log.v_ned_h[it, :] = q3.v_ned
+ 
+    it += 1
+ 
+    # Stop if crash
+    if (qt.crashed == 1 or q1.crashed == 1 or q2.crashed == 1 or q3.crashed == 1):
+        break
+ 
+pl.figure(1)
+pl.title("2D Position [m]")
+pl.plot(qt_log.xyz_h[:, 0], qt_log.xyz_h[:, 1], label="qt", color=quadcolor[0])
+pl.plot(q1_log.xyz_h[:, 0], q1_log.xyz_h[:, 1], label="q1", color=quadcolor[1])
+pl.plot(q2_log.xyz_h[:, 0], q2_log.xyz_h[:, 1], label="q2", color=quadcolor[2])
+pl.plot(q3_log.xyz_h[:, 0], q3_log.xyz_h[:, 1], label="q3", color=quadcolor[3])
+pl.xlabel("East")
+pl.ylabel("South")
+pl.legend()
+ 
+pl.figure(2)
+pl.plot(time, q1_log.att_h[:, 2], label="yaw q1")
+pl.plot(time, q2_log.att_h[:, 2], label="yaw q2")
+pl.plot(time, q3_log.att_h[:, 2], label="yaw q3")
+pl.xlabel("Time [s]")
+pl.ylabel("Yaw [rad]")
+pl.grid()
+pl.legend()
+ 
+pl.figure(3)
+pl.plot(time, -q1_log.xyz_h[:, 2], label="$q_1$")
+pl.plot(time, -q2_log.xyz_h[:, 2], label="$q_2$")
+pl.plot(time, -q3_log.xyz_h[:, 2], label="$q_3$")
+pl.xlabel("Time [s]")
+pl.ylabel("Altitude [m]")
+pl.grid()
+pl.legend(loc=2)
+ 
+ 
+pl.pause(0)

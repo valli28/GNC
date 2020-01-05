@@ -72,6 +72,24 @@ class quadrotor:
         # Estimators
         self.xi_g = 9.8 # Initial guess of gravity
         self.xi_CD = 0
+        self.rel_xyz = 0 #[]
+        self.neighbour_vector = 0 #[]
+
+    '''
+    def broadcast_rel_xyz(qx, qt):
+        rel_xyz = qx.xyz - qt.xyz
+        return rel_xyz
+    '''
+    #'''
+    def broadcast_rel_xyz(self, qt):
+        self.rel_xyz = qt.xyz - self.xyz 
+        return self.rel_xyz
+    #'''
+    #'''
+    def calc_neighbour_vector(self, qx):
+        self.neighbour_vector = self.rel_xyz - qx.rel_xyz
+        return self.neighbour_vector
+    #'''
 
     ### GNC Functions ###
     def control_att(self):
